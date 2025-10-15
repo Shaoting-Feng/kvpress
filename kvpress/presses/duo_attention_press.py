@@ -16,6 +16,7 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
 from kvpress.presses.base_press import BasePress
+import csv
 
 PATTERNS_DICT = {
     "togethercomputer/Llama-2-7B-32K-Instruct": "Llama-2-7B-32K-Instruct/lr%3D0.02-reg%3D0.05-ctx%3D1000_32000-multi_passkey10",  # noqa: E501
@@ -65,6 +66,7 @@ class DuoAttentionPress(BasePress):
 
     head_compression_ratio: float = 0.0
     on_the_fly_scoring: bool = False
+    csv_file: str = "duo_compression_ratios_ruler.csv"
     compression_ratio_: float = field(init=False, default=None)
     recent_size: int = field(init=False, default=None)
     sink_size: int = field(init=False, default=None)
@@ -96,6 +98,8 @@ class DuoAttentionPress(BasePress):
     def compression_ratio(self, value):
         raise AttributeError(f"compression ratio cannot be set for {type(self).__name__}")
 
+    csv_initialized: bool = field(init=False, default=False)
+
     def compress(self, module, hidden_states, keys, values, attentions, kwargs):
 
         assert module.config._attn_implementation != "eager", "eager mode not supported"
@@ -103,18 +107,32 @@ class DuoAttentionPress(BasePress):
             raise ValueError(
                 "Streaming mask not initialized. Make sure to call __post_init_from_model__ to initialize this press."
             )
-        k_len = keys.shape[2]
+        q_len = hidden_states.shape[1]
 
-        if (self.head_compression_ratio > 0) or (k_len > (self.sink_size + self.recent_size)):
+        if (self.head_compression_ratio > 0) or (q_len > (self.sink_size + self.recent_size)):
 
             # Save indices to mask during the attention mechanism. Please refer to attention_patch.py for more details
             masked_keys = torch.zeros_like(keys[..., 0], dtype=torch.bool)
             masked_keys[:, self.streaming_mask[module.layer_idx], self.sink_size : -self.recent_size] = True
             module.masked_key_indices = torch.nonzero(masked_keys, as_tuple=True)
 
-        # Compute the compression ratio
-        self.compression_ratio_ = self.streaming_mask.float().mean().item()
-        self.compression_ratio_ *= 1 - (self.sink_size + self.recent_size) / k_len
+            # Compute the compression ratio
+            self.compression_ratio_new = self.streaming_mask.float().mean().item()
+            self.compression_ratio_new *= 1 - (self.sink_size + self.recent_size) / q_len
+        else:
+            self.compression_ratio_new = 0
+        
+        if self.compression_ratio_ != self.compression_ratio_new:
+            self.compression_ratio_ = self.compression_ratio_new
+            csv_file = self.csv_file
+            
+            mode = "w" if not self.csv_initialized else "a"
+            with open(csv_file, mode=mode, newline="") as f:
+                writer = csv.writer(f)
+                if not self.csv_initialized:
+                    writer.writerow(["Compression Ratio"])  # header once per run
+                    self.csv_initialized = True
+                writer.writerow([f"{self.compression_ratio_:.3f}"])
 
         return keys, values
 
