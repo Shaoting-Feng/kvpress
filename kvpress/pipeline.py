@@ -9,6 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, Cache, DynamicCache, Pipeline, QuantizedCache
 from transformers.pipelines import PIPELINE_REGISTRY
 from transformers.pipelines.base import GenericTensor
+import copy
 
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.decoding_press import DecodingPress
@@ -26,7 +27,7 @@ class KVPressTextGenerationPipeline(Pipeline):
     - Prefill on the *context* (with KV compression if provided)
     - Collect context prefill logits for tokens 2..N
     - Use last-context logits to seed greedy decoding (no question needed)
-    - Return answer + per-step decode logits + context prefill logits
+    - Return answer + per-step decode logits + context prefill logits + context_ids
     """
 
     def _sanitize_parameters(
@@ -59,13 +60,8 @@ class KVPressTextGenerationPipeline(Pipeline):
     ):
         """
         Minimal preprocess:
-        - Prepend a single BOS if available
         - Encode context only (no chat template, no question)
         """
-        # bos_token = getattr(self.tokenizer, "bos_token", "")
-        # if bos_token:
-        #     context = bos_token + context
-
         context_ids = self.tokenizer.encode(context, return_tensors="pt", add_special_tokens=False)
 
         if context_ids.shape[1] > max_context_length:
@@ -74,8 +70,8 @@ class KVPressTextGenerationPipeline(Pipeline):
             )
             context_ids = context_ids[:, :max_context_length]
 
-        # Debug (optional):
-        # print("Context token IDs:", context_ids.shape, context_ids[0, :20].tolist())
+        # Stash exact IDs so downstream consumers can avoid re-tokenization.
+        self._context_ids = context_ids.clone()
 
         return {"context_ids": context_ids}
 
@@ -109,13 +105,25 @@ class KVPressTextGenerationPipeline(Pipeline):
                 position_ids=context_position_ids,
                 output_attentions=self.output_attentions(press),
             )
-            # Save context prefill logits (tokens 2..N) to CPU
-            self._context_logits = outputs_ctx.logits[0, 1:, :].detach().cpu()
-            # Save the last-context-step logits to seed decoding
-            self._last_ctx_logits = outputs_ctx.logits[0, -1].detach().cpu()
+
+            # Save context prefill logits (tokens 2..N) to CPU (The first is to predict the SECOND token from the context, only removed the BOS token's logits)
+            self._context_logits = outputs_ctx.logits[0, 1:-1, :].detach().cpu()
 
             logger.debug(f"Context Length: {context_length}")
             logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
+
+        if perform_prefill_compression:
+            compressed_cache = copy.deepcopy(cache)
+            outputs_ctx = self.model(
+                input_ids=context_ids,
+                past_key_values=compressed_cache,
+                position_ids=context_position_ids,
+                output_attentions=self.output_attentions(press),
+            )
+            self._compressed_context_logits = outputs_ctx.logits[0, 1:-1, :].detach().cpu()
+
+        # Save the last-context-step logits to seed decoding
+        self._last_ctx_logits = outputs_ctx.logits[0, -1].detach().cpu()
 
         # Decoding compression applies to decoding or prefill-decoding presses
         perform_decoding_compression = press is not None and isinstance(press, (DecodingPress, PrefillDecodingPress))
@@ -208,8 +216,10 @@ class KVPressTextGenerationPipeline(Pipeline):
 
     def postprocess(self, model_outputs, *args, **kwargs):
         context_logits = getattr(self, "_context_logits", None)
+        compressed_context_logits = getattr(self, "_compressed_context_logits", None)
+        context_ids = getattr(self, "_context_ids", None)
         ans, logits = model_outputs[0]
-        return {"answer": ans, "logits": logits, "context_logits": context_logits}
+        return {"answer": ans, "logits": logits, "context_logits": context_logits, "compressed_context_logits": compressed_context_logits, "context_ids": context_ids}
 
 
 PIPELINE_REGISTRY.register_pipeline(
