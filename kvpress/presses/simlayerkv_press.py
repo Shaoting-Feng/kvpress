@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field  # ADDED: field
+from typing import List  # ADDED: List
 
 import torch
 from torch import nn
@@ -48,6 +49,7 @@ class SimLayerKVPress(BasePress):
     def __post_init__(self):
         assert 0.0 <= self.lazy_threshold <= 1.0, "lazy_threshold should be in [0, 1]"
         self.compression_ratios = []
+        self.ratios: List[float] = []  # ADDED: per-context mean real ratios
 
     def is_lazy(
         self,
@@ -79,6 +81,37 @@ class SimLayerKVPress(BasePress):
     def compression_ratio(self, value):
         raise AttributeError(f"compression ratio cannot be set for {type(self).__name__}")
 
+    # ADDED: tiny helper to detect last layer robustly
+    def _is_last_layer(self, module: nn.Module) -> bool:
+        idx = getattr(module, "layer_idx", None)
+        if idx is None:
+            return False
+        n = (
+            getattr(module, "num_hidden_layers", None)
+            or getattr(getattr(module, "config", None), "num_hidden_layers", None)
+            or getattr(getattr(getattr(module, "model", None), "config", None), "num_hidden_layers", None)
+        )
+        try:
+            return n is not None and int(idx) == int(n) - 1
+        except Exception:
+            return False
+
+    # ADDED: log once per context (mean over layers) when we hit the last layer
+    def _maybe_log_context_end(self, module: nn.Module) -> None:
+        if self._is_last_layer(module) and self.compression_ratios:
+            mean_ratio = sum(self.compression_ratios) / len(self.compression_ratios)
+            self.ratios.append(float(mean_ratio))
+
+    # ADDED: Duo-style getter
+    def pop_logged_ratios(self) -> List[float]:
+        """
+        Mirror DuoAttentionPress.pop_logged_ratios(): return a list of per-context
+        real compression ratios (keep ratios) and clear the internal buffer.
+        """
+        out = list(self.ratios)
+        self.ratios.clear()
+        return out
+
     def compress(
         self,
         module: nn.Module,
@@ -102,6 +135,7 @@ class SimLayerKVPress(BasePress):
 
         if (self.lazy_threshold == 1.0) or (k_len <= min_length):
             self.compression_ratios.append(0.0)
+            self._maybe_log_context_end(module)  # ADDED
             return keys, values
 
         # Compression
@@ -113,4 +147,5 @@ class SimLayerKVPress(BasePress):
         else:
             self.compression_ratios.append(0.0)
 
+        self._maybe_log_context_end(module)  # ADDED
         return keys, values

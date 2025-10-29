@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from io import StringIO
+from typing import List  # <-- added
 
 import numpy as np
 import requests  # type: ignore[import-untyped]
@@ -70,6 +71,16 @@ class DuoAttentionPress(BasePress):
     sink_size: int = field(init=False, default=None)
     streaming_mask: torch.Tensor = field(init=False, default=None)
 
+    # --- added: in-memory per-context logging (and a guard flag) ---
+    ratios: List[float] = field(init=False, default_factory=list)
+    _pending_logged: bool = field(init=False, default=False)
+    # ----------------------------------------------------------------
+
+    def pop_logged_ratios(self) -> List[float]:
+        out = list(self.ratios)
+        self.ratios.clear()
+        return out
+    
     def __post_init_from_model__(self, model):
         """
         Initialize sink_size, recent_size, and streaming_mask from a model
@@ -114,7 +125,17 @@ class DuoAttentionPress(BasePress):
 
         # Compute the compression ratio
         self.compression_ratio_ = self.streaming_mask.float().mean().item()
-        self.compression_ratio_ *= 1 - (self.sink_size + self.recent_size) / k_len
+        self.compression_ratio_ *= max(0.0, 1.0 - (self.sink_size + self.recent_size) / float(k_len))  # <-- only change
+
+        # --- added: log exactly once per context at prefill last layer ---
+        q_len = hidden_states.shape[1]
+        prefill = (q_len == k_len)
+        if prefill and module.layer_idx == 0:
+            self._pending_logged = False
+        if prefill and (module.layer_idx == module.config.num_hidden_layers - 1) and not self._pending_logged:
+            self._pending_logged = True
+            self.ratios.append(self.compression_ratio_)
+        # -----------------------------------------------------------------
 
         return keys, values
 
