@@ -96,6 +96,7 @@ class ScorerPress(BasePress):
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, module.head_dim)
 
         # Prune keys and values
+        indices = indices.to(keys.device)
         keys = keys.gather(2, indices).contiguous()
         values = values.gather(2, indices).contiguous()
 
