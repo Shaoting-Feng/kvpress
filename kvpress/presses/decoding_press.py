@@ -42,7 +42,6 @@ class DecodingPress(BasePress):
 
     base_press: ScorerPress | AdaKVPress
     compression_interval: int = 128
-    target_size: int = 1024
     hidden_states_buffer_size: int = 128
 
     def __post_init__(self):
@@ -52,13 +51,8 @@ class DecodingPress(BasePress):
         self.layer_step_counts = defaultdict(int)  # Track step count per layer
 
         assert self.compression_interval > 0, "compression_interval must be greater than 0"
-        assert self.target_size > 0, "target_size must be greater than 0"
 
-        if self.base_press.compression_ratio:
-            logger.warning(
-                f"compression_ratio is set for base press ({self.base_press.compression_ratio}). "
-                f"This will be overridden by the decoding press."
-            )
+        self.rates = []
 
     def compress(
         self,
@@ -95,8 +89,8 @@ class DecodingPress(BasePress):
             storing existing scores in a buffer (e.g. KNormPress) and reusing them in subsequent compressions.
         """
         k_len = keys.shape[2]
-        target_compression_ratio = self._find_target_compression_ratio(k_len, self.target_size)
-        logger.debug(f"Compressing {k_len} to {self.target_size} with ratio {target_compression_ratio}")
+        target_compression_ratio = self._find_target_compression_ratio(k_len, int(k_len*(1-self.base_press.compression_ratio)))
+        logger.debug(f"Compressing {k_len} to {int(k_len*(1-self.base_press.compression_ratio))} with ratio {target_compression_ratio}")
 
         original_compression_ratio = self.base_press.compression_ratio
         self.base_press.compression_ratio = target_compression_ratio
@@ -131,7 +125,7 @@ class DecodingPress(BasePress):
         self.layer_step_counts[layer_idx] += 1
 
         # Apply compression if we've reached the compression step threshold
-        if (self.layer_step_counts[layer_idx] >= self.compression_interval) or (q_len >= self.target_size):
+        if (self.layer_step_counts[layer_idx] >= self.compression_interval):
             logger.debug(
                 f"Applying decoding compression: layer_step_count ({self.layer_step_counts[layer_idx]}) >= compression_steps ({self.compression_interval})"  # noqa: E501
             )
@@ -147,6 +141,8 @@ class DecodingPress(BasePress):
             keys, values = self.compress(module, buffered_hidden_states, keys, values, attentions, kwargs)
             logger.debug(f"Applied decoding compression: " f"keys.shape: {keys.shape}, values.shape: {values.shape}")
 
+            self.rates.append(1 - keys.shape[2] / cache_layer.get_seq_length())
+
             # Update cache with compressed keys and values
             if isinstance(cache, QuantizedCache):
                 cache_layer._quantized_keys = cache_layer._quantize(keys, axis=cache_layer.axis_key)
@@ -159,7 +155,7 @@ class DecodingPress(BasePress):
                 cache_layer.values = values
 
             # Reset step count and clear buffer for this layer
-            self.layer_step_counts[layer_idx] = 0
+            self.layer_step_counts[layer_idx] = -float("inf")
             # Always clear the buffer after compression - otherwise there's a mismatch between
             # hidden states buffer and kv cache
             self.hidden_states_buffer[layer_idx] = []
@@ -175,6 +171,12 @@ class DecodingPress(BasePress):
         """Reset the decoding press state."""
         self.hidden_states_buffer = defaultdict(list)
         self.layer_step_counts = defaultdict(int)
+
+    def get_and_reset_compression_rate(self) -> float:
+        # Compute average compression rate safely (handle empty rates)
+        actual_compression_rate = float(sum(self.rates) / len(self.rates))
+        self.rates = []
+        return actual_compression_rate
 
     def _find_target_compression_ratio(self, q_len: int, target_tokens: int) -> float:
         """

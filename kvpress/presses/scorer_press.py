@@ -93,6 +93,26 @@ class ScorerPress(BasePress):
         k_len = keys.shape[2]
         n_kept = int(k_len * (1 - self.compression_ratio))
         indices = scores.topk(n_kept, dim=-1).indices
+
+        from kvpress.presses.observed_attention_press import ObservedAttentionPress
+        if isinstance(self, ObservedAttentionPress):
+            # IMPRESS
+            h0 = torch.unique(indices[0, 0])
+            h1 = torch.unique(indices[0, 1])
+            h2 = torch.unique(indices[0, 2])
+            def jac(a, b):
+                inter = torch.sum(torch.isin(a, b))
+                union = len(a) + len(b) - inter
+                return float(inter) / float(union) if union > 0 else 0.0
+            sim = (jac(h0, h1) + jac(h0, h2) + jac(h1, h2)) / 3
+            threshold = ((1-self.compression_ratio)/(1+self.compression_ratio))**0.6
+            if sim >= threshold:
+                merged = torch.unique(torch.cat([h0, h1, h2]))
+                indices = merged.view(1, 1, -1)
+            else:
+                return keys, values
+            indices = indices.repeat(1, keys.shape[1], 1)
+
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, module.head_dim)
 
         # Prune keys and values

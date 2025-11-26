@@ -235,6 +235,10 @@ class KVPressTextGenerationPipeline(Pipeline):
                 self._remove_answer_from_cache(cache, cache_seq_lengths)
 
                 answers.append(answer)
+        
+        if perform_decoding_compression:
+            press.reset()
+        
         return answers
 
     def _remove_answer_from_cache(self, cache: Cache, cache_seq_lengths: list[int]):

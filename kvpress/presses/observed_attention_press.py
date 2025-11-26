@@ -59,4 +59,5 @@ class ObservedAttentionPress(ScorerPress):
         n_tokens_in_sum = torch.arange(n_tokens, 0, -1).to(attentions.device, attentions.dtype)
         scores = scores / n_tokens_in_sum
         scores = scores.view(bsz, num_key_value_heads, -1, n_tokens).mean(2)
+        scores = scores[:, :3, :]
         return scores
