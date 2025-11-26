@@ -172,7 +172,7 @@ class DecodingPress(BasePress):
         self.hidden_states_buffer = defaultdict(list)
         self.layer_step_counts = defaultdict(int)
 
-    def get_and_reset_compression_rate(self) -> float:
+    def pop_logged_ratios(self) -> float:
         # Compute average compression rate safely (handle empty rates)
         actual_compression_rate = float(sum(self.rates) / len(self.rates))
         self.rates = []
