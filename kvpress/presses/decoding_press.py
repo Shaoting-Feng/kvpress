@@ -139,7 +139,7 @@ class DecodingPress(BasePress):
             # Apply compression using buffered hidden states for this layer
             buffered_hidden_states = torch.cat(self.hidden_states_buffer[layer_idx], dim=1)
             keys, values = self.compress(module, buffered_hidden_states, keys, values, attentions, kwargs)
-            logger.debug(f"Applied decoding compression: " f"keys.shape: {keys.shape}, values.shape: {values.shape}")
+            logger.debug(f"Applied decoding compression for "f"{layer_idx}"": " f"keys.shape: {keys.shape}, values.shape: {values.shape}")
 
             self.rates.append(1 - keys.shape[2] / cache_layer.get_seq_length())
 
