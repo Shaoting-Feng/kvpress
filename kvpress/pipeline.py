@@ -96,10 +96,8 @@ class KVPressTextGenerationPipeline(Pipeline):
         }
         forward_kwargs = {"press": press, "max_new_tokens": max_new_tokens, "cache": cache}
         if isinstance(press, DecodingPress) or (hasattr(press, "press") and isinstance(press.press, DecodingPress)):
-            print("setting h2o_flag to true")
             self.h2o_flag = True
         else:
-            print("setting h2o_flag to false")
             self.h2o_flag = False
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
@@ -290,7 +288,6 @@ class KVPressTextGenerationPipeline(Pipeline):
 
         # if the user doesn't provide a question, skip forward pass
         if self.h2o_flag:
-            print("h2o_flag is true")
             outputs = self.model(
                 input_ids=question_ids.to(self.model.device),
                 past_key_values=cache,
@@ -299,7 +296,6 @@ class KVPressTextGenerationPipeline(Pipeline):
                 use_eager=True,
             )
         else:
-            print("h2o_flag is false")
             outputs = self.model(
                 input_ids=question_ids.to(self.model.device),
                 past_key_values=cache,
