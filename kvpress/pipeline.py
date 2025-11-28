@@ -95,6 +95,10 @@ class KVPressTextGenerationPipeline(Pipeline):
             "max_context_length": max_context_length,
         }
         forward_kwargs = {"press": press, "max_new_tokens": max_new_tokens, "cache": cache}
+        if isinstance(press, ObservedAttentionPress) or (hasattr(press, "press") and isinstance(press.press, ObservedAttentionPress)):
+            self.h2o_flag = True
+        else:
+            self.h2o_flag = False
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
     def preprocess(
@@ -283,12 +287,21 @@ class KVPressTextGenerationPipeline(Pipeline):
         ).unsqueeze(0)
 
         # if the user doesn't provide a question, skip forward pass
-        outputs = self.model(
-            input_ids=question_ids.to(self.model.device),
-            past_key_values=cache,
-            position_ids=position_ids,
-            num_logits_to_keep=1,
-        )
+        if self.h2o_flag:
+            outputs = self.model(
+                input_ids=question_ids.to(self.model.device),
+                past_key_values=cache,
+                position_ids=position_ids,
+                num_logits_to_keep=1,
+                use_eager=True,
+            )
+        else:
+            outputs = self.model(
+                input_ids=question_ids.to(self.model.device),
+                past_key_values=cache,
+                position_ids=position_ids,
+                num_logits_to_keep=1,
+            )
 
         position_ids = position_ids[:, -1:] + 1
         generated_ids = [outputs.logits[0, -1].argmax()]
@@ -311,9 +324,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         return answer
 
     def output_attentions(self, press: BasePress):
-        if isinstance(press, ObservedAttentionPress):
-            return True
-        if hasattr(press, "press") and isinstance(press.press, ObservedAttentionPress):
+        if self.h2o_flag:
             return True
         return False
 
