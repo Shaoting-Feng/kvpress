@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import os
+import numpy as np
 
 from kvpress.presses.base_press import BasePress
 
@@ -106,10 +108,19 @@ class ScorerPress(BasePress):
                 return float(inter) / float(union) if union > 0 else 0.0
             sim = (jac(h0, h1) + jac(h0, h2) + jac(h1, h2)) / 3
             threshold = ((1-self.compression_ratio)/(1+self.compression_ratio))**0.6
+            
+            # Record positions
+            prefix = os.getenv("PREFIX")
+            filename = prefix + f"l{kwargs["layer_idx"]}.npy"
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
             if sim >= threshold:
                 merged = torch.unique(torch.cat([h0, h1, h2]))
                 indices = merged.view(1, 1, -1)
+                np.save(filename, merged.detach().cpu().numpy())
             else:
+                merged = torch.arange(kwargs["seq_length"], device=keys.device)
+                np.save(filename, merged.detach().cpu().numpy())
                 return keys, values
             indices = indices.repeat(1, keys.shape[1], 1)
 

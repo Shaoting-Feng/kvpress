@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from transformers.cache_utils import QuantizedCache
+import os
+import numpy as np
 
 from kvpress.presses.adakv_press import AdaKVPress
 from kvpress.presses.base_press import BasePress
@@ -131,6 +133,15 @@ class DecodingPress(BasePress):
             )
 
             cache_layer = cache.layers[module.layer_idx]
+
+            # For record
+            kwargs["seq_length"] = cache_layer.get_seq_length()
+            kwargs["layer_idx"] = layer_idx
+            prefix = os.getenv("PREFIX")
+            filename = prefix + f"seq_length.npy"
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            np.save(filename, kwargs["seq_length"])
+
             keys, values = extract_keys_and_values(cache, module.layer_idx)
 
             # Get attention weights from output
