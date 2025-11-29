@@ -114,6 +114,10 @@ class ScorerPress(BasePress):
             question_index = os.getenv("QUESTION_INDEX")
             filename = prefix + f"q{question_index}/l{kwargs["layer_idx"]}.npy"
             os.makedirs(os.path.dirname(filename), exist_ok=True)
+            if kwargs["layer_idx"] == 0:
+                filename2 = prefix + f"q{question_index}/seq_length.npy"
+                os.makedirs(os.path.dirname(filename2), exist_ok=True)
+                np.save(filename2, k_len)
             
             if sim >= threshold:
                 merged = torch.unique(torch.cat([h0, h1, h2]))
