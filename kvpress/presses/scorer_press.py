@@ -111,7 +111,8 @@ class ScorerPress(BasePress):
             
             # Record positions
             prefix = os.getenv("PREFIX")
-            filename = prefix + f"l{kwargs["layer_idx"]}.npy"
+            question_index = os.getenv("QUESTION_INDEX")
+            filename = prefix + f"q{question_index}/l{kwargs["layer_idx"]}.npy"
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             
             if sim >= threshold:

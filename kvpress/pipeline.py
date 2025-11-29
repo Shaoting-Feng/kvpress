@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM, Cache, DynamicCache, Pipeline, QuantizedCache
 from transformers.pipelines import PIPELINE_REGISTRY
 from transformers.pipelines.base import GenericTensor
+import os
 
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.decoding_press import DecodingPress
@@ -82,6 +83,9 @@ class KVPressTextGenerationPipeline(Pipeline):
                 - forward_kwargs: The keyword arguments for the forward function.
                 - postprocess_kwargs: The keyword arguments for the postprocess function.
         """
+        question_idx = kwargs.get("question_idx", None)
+        if question_idx:
+            os.environ["QUESTION_INDEX"] = str(question_idx)
 
         answer_prefix = answer_prefix or ""
         postprocess_kwargs = {"single_question": questions is None}
