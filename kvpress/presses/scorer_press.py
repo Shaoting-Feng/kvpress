@@ -124,7 +124,7 @@ class ScorerPress(BasePress):
                 indices = merged.view(1, 1, -1)
                 np.save(filename, merged.detach().cpu().numpy())
             else:
-                merged = torch.arange(kwargs["seq_length"], device=keys.device)
+                merged = torch.arange(k_len, device=keys.device)
                 np.save(filename, merged.detach().cpu().numpy())
                 return keys, values
             indices = indices.repeat(1, keys.shape[1], 1)
