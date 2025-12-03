@@ -88,13 +88,31 @@ class ScorerPress(BasePress):
         if self.compression_ratio == 0:
             return keys, values
 
-        # Compute scores
-        scores = self.score(module, hidden_states, keys, values, attentions, kwargs)
+        from kvpress.presses.impress_press import ImpressPress
+        if isinstance(self, ImpressPress):
+            prefix = os.getenv("IMPRESS_PREFIX")
+            question_index = os.getenv("QUESTION_INDEX")
+            filename = prefix + f"q{question_index}_tokens.npy"
+            arr = np.load(filename)          # int numpy array: token ids
 
-        # Get indices of KV pairs with the lowest scores
-        k_len = keys.shape[2]
-        n_kept = int(k_len * (1 - self.compression_ratio))
-        indices = scores.topk(n_kept, dim=-1).indices
+            # ---- Safety: filter out invalid token ids ----
+            B, H, S, _ = keys.shape
+            k_len = S
+            arr = arr.astype(np.int64)
+            valid_mask = (arr >= 0) & (arr < k_len)
+            keep = arr[valid_mask]
+
+            # ---- convert to torch ----
+            base_indices = torch.tensor(keep, device=keys.device, dtype=torch.long)
+            base_indices = base_indices.view(1, 1, -1)
+            indices = base_indices.expand(B, H, -1)
+        else:
+            # Compute scores
+            scores = self.score(module, hidden_states, keys, values, attentions, kwargs)
+            # Get indices of KV pairs with the lowest scores
+            k_len = keys.shape[2]
+            n_kept = int(k_len * (1 - self.compression_ratio))
+            indices = scores.topk(n_kept, dim=-1).indices
 
         from kvpress.presses.observed_attention_press import ObservedAttentionPress
         if isinstance(self, ObservedAttentionPress):
