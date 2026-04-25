@@ -82,7 +82,9 @@ def attention_patch(func):
         # cu_seq_lens_k are only in kwargs if model.generate is used.
         if "cu_seq_lens_k" in kwargs:
             kwargs["cu_seq_lens_k"][-1] = key.shape[-2]
-        return func(module, query, key, value, attention_mask, dropout, **kwargs)
+        # Pass dropout by keyword so we don't clash with backends where the 6th positional
+        # arg is not `dropout` (e.g. flex_attention_forward takes `scaling` there).
+        return func(module, query, key, value, attention_mask, dropout=dropout, **kwargs)
 
     return wrapper
 

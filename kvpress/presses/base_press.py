@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from transformers import (
     Gemma3ForConditionalGeneration,
+    GptOssForCausalLM,
     LlamaForCausalLM,
     MistralForCausalLM,
     Phi3ForCausalLM,
@@ -31,6 +32,7 @@ SUPPORTED_MODELS = (
     Qwen2ForCausalLM,
     Qwen3ForCausalLM,
     Gemma3ForConditionalGeneration,
+    GptOssForCausalLM,
 )
 
 
@@ -184,6 +186,8 @@ class BasePress:
 
         if isinstance(model, Gemma3ForConditionalGeneration):
             logger.warning_once("Compression in Gemma3 is only applied to layer without sliding window attention")
+        if isinstance(model, GptOssForCausalLM):
+            logger.warning_once("Compression in GPT-OSS is only applied to layers with full (non-sliding) attention")
 
         self.post_init_from_model(model)
         hooks = []
@@ -192,6 +196,9 @@ class BasePress:
             for layer in language_model.layers:
                 if isinstance(model, Gemma3ForConditionalGeneration) and layer.self_attn.is_sliding:
                     # Skip layers with sliding window attention, only for Gemma3
+                    continue
+                if isinstance(model, GptOssForCausalLM) and getattr(layer.self_attn, "sliding_window", None):
+                    # Skip layers with sliding window attention for GPT-OSS
                     continue
                 layer.self_attn.rotary_emb = language_model.rotary_emb
                 hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))

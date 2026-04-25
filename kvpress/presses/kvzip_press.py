@@ -10,11 +10,28 @@ from typing import Generator, List
 
 import torch
 from torch import nn
-from transformers import AutoTokenizer, Gemma3PreTrainedModel, PreTrainedModel, PreTrainedTokenizer, QuantizedCache
+from transformers import (
+    AutoTokenizer,
+    Gemma3PreTrainedModel,
+    GptOssForCausalLM,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+    QuantizedCache,
+)
+from transformers.models.gpt_oss.modeling_gpt_oss import GptOssAttention
 from transformers.models.llama.modeling_llama import rotate_half
 
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
 from kvpress.utils import extract_keys_and_values, get_prerope_query_states
+
+
+def _is_sliding_attn_layer(layer) -> bool:
+    """Return True if the given decoder layer uses sliding window attention and should be skipped."""
+    attn = layer.self_attn
+    if getattr(attn, "is_sliding", False):
+        return True
+    # GPT-OSS sets ``sliding_window`` to None for full-attention layers and to an int for sliding layers.
+    return bool(getattr(attn, "sliding_window", None))
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +107,12 @@ class KVzipPress(BasePress):
         if isinstance(model, Gemma3PreTrainedModel):
             raise ValueError("KVzipPress is not supported for Gemma3ForCausalLM")
 
+        if isinstance(model, GptOssForCausalLM):
+            logger.warning_once(
+                "KVzipPress on GPT-OSS only compresses full-attention layers; "
+                "sliding window attention layers are left untouched."
+            )
+
         # Store model reference for later use
         tokenizer = AutoTokenizer.from_pretrained(model.config.name_or_path)
 
@@ -133,6 +156,9 @@ class KVzipPress(BasePress):
             if self.compression_ratio > 0 and self._context_ids is not None:
                 # Now register attention hooks for compression
                 for layer in model.model.layers:
+                    if _is_sliding_attn_layer(layer):
+                        # Sliding window attention layers are skipped (no compression)
+                        continue
                     layer.self_attn.rotary_emb = model.model.rotary_emb
                     hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
 
@@ -243,6 +269,13 @@ class KVzipPress(BasePress):
         )
         self.score_val[..., : self.n_sink] = 1.0
 
+        # Protect sliding-window-attention layers from compression by pinning their scores
+        # to the max finite value — bottom-k (via topk of -score) will never select them.
+        max_score = torch.finfo(self.score_val.dtype).max
+        for layer_idx, layer in enumerate(model.model.layers):
+            if _is_sliding_attn_layer(layer):
+                self.score_val[layer_idx] = max_score
+
         chunked_context_pairs = []
         chunked_input_ids = self._chunk_fn(ctx_ids, chunk_size)
         for i, a_ids in enumerate(chunked_input_ids):
@@ -306,7 +339,18 @@ class KVzipPress(BasePress):
 
         # Apply RoPE
         cos, sin = kwargs["position_embeddings"]
-        queries = (queries * cos.unsqueeze(1)) + (rotate_half(queries) * sin.unsqueeze(1))
+        cos_u = cos.unsqueeze(1)
+        sin_u = sin.unsqueeze(1)
+        if isinstance(module, GptOssAttention):
+            # GPT-OSS ships cos/sin of shape (bsz, seq_len, head_dim//2) and applies rotary as
+            # (first*cos - second*sin, second*cos + first*sin) on halves of the head.
+            first_half, second_half = torch.chunk(queries, 2, dim=-1)
+            queries = torch.cat(
+                (first_half * cos_u - second_half * sin_u, second_half * cos_u + first_half * sin_u),
+                dim=-1,
+            )
+        else:
+            queries = (queries * cos_u) + (rotate_half(queries) * sin_u)
         queries = queries.view(bsz, num_heads_kv, num_key_value_groups, q_len, head_dim)
 
         # Subsample keys
@@ -361,19 +405,33 @@ class KVzipPress(BasePress):
         if self.compression_ratio > 0:
             n_layer, bsz, num_key_value_heads, ctx_len = self.score_val.shape
 
+            sliding_layer_mask = torch.tensor(
+                [_is_sliding_attn_layer(layer) for layer in model.model.layers],
+                dtype=torch.bool,
+                device=self.score_val.device,
+            )
+            n_compressible_layers = int((~sliding_layer_mask).sum().item())
+            n_tokens_per_layer = bsz * num_key_value_heads * ctx_len
+
             # calculate the pruned KV pairs across layers
             if self.layerwise:
-                nl = int(bsz * num_key_value_heads * ctx_len * self.compression_ratio)
+                nl = int(n_tokens_per_layer * self.compression_ratio)
                 n_pruned_layers = nl * torch.ones(n_layer, device=self.score_val.device, dtype=torch.int)
+                n_pruned_layers[sliding_layer_mask] = 0
             else:
-                n_pruned_indices = int(self.score_val.numel() * self.compression_ratio)
+                # compression_ratio is defined over compressible (full-attention) layers only
+                n_pruned_indices = int(n_compressible_layers * n_tokens_per_layer * self.compression_ratio)
                 pruned_indices = torch.topk(-self.score_val.reshape(-1), n_pruned_indices).indices
-                n_tokens_per_layer = bsz * num_key_value_heads * ctx_len
                 n_pruned_layers = torch.bincount(pruned_indices // n_tokens_per_layer, minlength=n_layer).int()
 
             for layer in model.model.layers:
                 module = layer.self_attn
                 layer_idx = int(module.layer_idx)
+
+                if _is_sliding_attn_layer(layer):
+                    # Sliding window attention layers are not compressed
+                    module.masked_key_indices = None
+                    continue
 
                 assert module.config._attn_implementation != "eager", "eager mode not supported"
 
