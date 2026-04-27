@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers.models.gpt_oss.modeling_gpt_oss import GptOssAttention
 from transformers.models.llama.modeling_llama import repeat_kv, rotate_half
 
 from kvpress.presses.scorer_press import ScorerPress
@@ -55,7 +56,19 @@ class SnapKVPress(ScorerPress):
         # Apply RoPE
         cos, sin = position_embeddings
         cos, sin = cos[:, -window_size:], sin[:, -window_size:]
-        query_states = (query_states * cos.unsqueeze(1)) + (rotate_half(query_states) * sin.unsqueeze(1))
+        cos_u = cos.unsqueeze(1)
+        sin_u = sin.unsqueeze(1)
+        if isinstance(module, GptOssAttention):
+            # GPT-OSS applies rotary on halves of the head: cos/sin have shape
+            # (bsz, seq_len, head_dim//2) and the rotation is
+            # (first*cos - second*sin, second*cos + first*sin).
+            first_half, second_half = torch.chunk(query_states, 2, dim=-1)
+            query_states = torch.cat(
+                (first_half * cos_u - second_half * sin_u, second_half * cos_u + first_half * sin_u),
+                dim=-1,
+            )
+        else:
+            query_states = (query_states * cos_u) + (rotate_half(query_states) * sin_u)
 
         # Compute attention for first q_len - window_size tokens
         key_states = repeat_kv(keys, num_key_value_groups)
