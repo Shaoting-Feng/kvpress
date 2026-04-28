@@ -20,13 +20,17 @@ from transformers import (
 )
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssAttention
 from transformers.models.llama.modeling_llama import rotate_half
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeAttention, Qwen3_5MoeDynamicCache
 
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
 from kvpress.utils import extract_keys_and_values, get_prerope_query_states
 
 
 def _is_sliding_attn_layer(layer) -> bool:
-    """Return True if the given decoder layer uses sliding window attention and should be skipped."""
+    """Return True if the given decoder layer should be skipped: sliding-window attention,
+    or non-attention (e.g. Qwen3.5 MoE GatedDeltaNet layers, which have no traditional KV cache)."""
+    if not hasattr(layer, "self_attn"):
+        return True
     attn = layer.self_attn
     if getattr(attn, "is_sliding", False):
         return True
@@ -154,12 +158,14 @@ class KVzipPress(BasePress):
 
             # After yield: KVzip scoring and compression phase
             if self.compression_ratio > 0 and self._context_ids is not None:
+                # Multimodal wrappers (e.g. Qwen3.5 MoE Conditional) nest layers under language_model
+                inner = model.model.language_model if hasattr(model.model, "language_model") else model.model
                 # Now register attention hooks for compression
-                for layer in model.model.layers:
+                for layer in inner.layers:
                     if _is_sliding_attn_layer(layer):
-                        # Sliding window attention layers are skipped (no compression)
+                        # Sliding window or non-attention layers are skipped (no compression)
                         continue
-                    layer.self_attn.rotary_emb = model.model.rotary_emb
+                    layer.self_attn.rotary_emb = inner.rotary_emb
                     hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
 
                 self._perform_kvzip_compression(model, tokenizer)
@@ -177,7 +183,6 @@ class KVzipPress(BasePress):
 
         hidden_states = kwargs["hidden_states"]
         cache = kwargs.get("past_key_values", None) or kwargs.get("past_key_value", None)
-        cache_layer = cache.layers[module.layer_idx]
 
         keys, values = extract_keys_and_values(cache, module.layer_idx)
 
@@ -185,6 +190,13 @@ class KVzipPress(BasePress):
         # retaining only the originally prefilled KV pairs.
         keys, values = self.score_kvzip(module, hidden_states, keys, values, output[1], kwargs)
 
+        if isinstance(cache, Qwen3_5MoeDynamicCache):
+            # Qwen3.5 MoE keeps parallel key_cache / value_cache lists (no .layers attribute)
+            cache.key_cache[module.layer_idx] = keys
+            cache.value_cache[module.layer_idx] = values
+            return output
+
+        cache_layer = cache.layers[module.layer_idx]
         if isinstance(cache, QuantizedCache):
             # Update cache with compressed keys and values
             cache_layer._quantized_keys = cache_layer._quantize(keys, axis=cache_layer.axis_key)
@@ -256,12 +268,15 @@ class KVzipPress(BasePress):
         """
         ctx_ids = self._context_ids[:, self.prefix_length :].to("cpu")
 
+        # Multimodal wrappers (Qwen3.5 MoE Conditional) nest the relevant config under text_config
+        text_cfg = getattr(model.config, "text_config", model.config)
+        inner = model.model.language_model if hasattr(model.model, "language_model") else model.model
         # initialize score values
         self.score_val = torch.zeros(
             (
-                model.config.num_hidden_layers,
+                text_cfg.num_hidden_layers,
                 1,
-                model.config.num_key_value_heads,
+                text_cfg.num_key_value_heads,
                 self.context_length,
             ),  # only support batch size of 1
             dtype=model.dtype,
@@ -269,10 +284,10 @@ class KVzipPress(BasePress):
         )
         self.score_val[..., : self.n_sink] = 1.0
 
-        # Protect sliding-window-attention layers from compression by pinning their scores
-        # to the max finite value — bottom-k (via topk of -score) will never select them.
+        # Protect skipped (sliding / linear-attention) layers from compression by pinning their
+        # scores to the max finite value — bottom-k (via topk of -score) will never select them.
         max_score = torch.finfo(self.score_val.dtype).max
-        for layer_idx, layer in enumerate(model.model.layers):
+        for layer_idx, layer in enumerate(inner.layers):
             if _is_sliding_attn_layer(layer):
                 self.score_val[layer_idx] = max_score
 
@@ -349,6 +364,11 @@ class KVzipPress(BasePress):
                 (first_half * cos_u - second_half * sin_u, second_half * cos_u + first_half * sin_u),
                 dim=-1,
             )
+        elif isinstance(module, Qwen3_5MoeAttention):
+            # Qwen3.5 uses partial RoPE: only the first cos.shape[-1] dims are rotated.
+            rotary_dim = cos_u.shape[-1]
+            q_rot, q_pass = queries[..., :rotary_dim], queries[..., rotary_dim:]
+            queries = torch.cat([(q_rot * cos_u) + (rotate_half(q_rot) * sin_u), q_pass], dim=-1)
         else:
             queries = (queries * cos_u) + (rotate_half(queries) * sin_u)
         queries = queries.view(bsz, num_heads_kv, num_key_value_groups, q_len, head_dim)
@@ -405,8 +425,9 @@ class KVzipPress(BasePress):
         if self.compression_ratio > 0:
             n_layer, bsz, num_key_value_heads, ctx_len = self.score_val.shape
 
+            inner = model.model.language_model if hasattr(model.model, "language_model") else model.model
             sliding_layer_mask = torch.tensor(
-                [_is_sliding_attn_layer(layer) for layer in model.model.layers],
+                [_is_sliding_attn_layer(layer) for layer in inner.layers],
                 dtype=torch.bool,
                 device=self.score_val.device,
             )
@@ -424,14 +445,14 @@ class KVzipPress(BasePress):
                 pruned_indices = torch.topk(-self.score_val.reshape(-1), n_pruned_indices).indices
                 n_pruned_layers = torch.bincount(pruned_indices // n_tokens_per_layer, minlength=n_layer).int()
 
-            for layer in model.model.layers:
+            for layer in inner.layers:
+                if _is_sliding_attn_layer(layer):
+                    # Sliding / linear-attention layers are not compressed
+                    if hasattr(layer, "self_attn"):
+                        layer.self_attn.masked_key_indices = None
+                    continue
                 module = layer.self_attn
                 layer_idx = int(module.layer_idx)
-
-                if _is_sliding_attn_layer(layer):
-                    # Sliding window attention layers are not compressed
-                    module.masked_key_indices = None
-                    continue
 
                 assert module.config._attn_implementation != "eager", "eager mode not supported"
 

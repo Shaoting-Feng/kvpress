@@ -18,8 +18,11 @@ from transformers import (
     PreTrainedModel,
     QuantizedCache,
     Qwen2ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
     Qwen3ForCausalLM,
 )
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDynamicCache
 
 from kvpress.utils import extract_keys_and_values
 
@@ -33,6 +36,8 @@ SUPPORTED_MODELS = (
     Qwen3ForCausalLM,
     Gemma3ForConditionalGeneration,
     GptOssForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
 )
 
 
@@ -134,7 +139,6 @@ class BasePress:
 
         hidden_states = kwargs["hidden_states"]
         cache = kwargs["past_key_values"]
-        cache_layer = cache.layers[module.layer_idx]
         q_len = hidden_states.shape[1]
 
         # Don't compress after pre-filling
@@ -145,6 +149,13 @@ class BasePress:
 
         keys, values = self.compress(module, hidden_states, keys, values, output[1], kwargs)
 
+        if isinstance(cache, Qwen3_5MoeDynamicCache):
+            # Qwen3.5 MoE keeps parallel key_cache / value_cache lists (no .layers attribute)
+            cache.key_cache[module.layer_idx] = keys
+            cache.value_cache[module.layer_idx] = values
+            return output
+
+        cache_layer = cache.layers[module.layer_idx]
         if isinstance(cache, QuantizedCache):
             cache_layer._quantized_keys = cache_layer._quantize(keys, axis=cache_layer.axis_key)
             cache_layer._quantized_values = cache_layer._quantize(values, axis=cache_layer.axis_value)
@@ -199,6 +210,9 @@ class BasePress:
                     continue
                 if isinstance(model, GptOssForCausalLM) and getattr(layer.self_attn, "sliding_window", None):
                     # Skip layers with sliding window attention for GPT-OSS
+                    continue
+                if not hasattr(layer, "self_attn"):
+                    # Qwen3.5 MoE linear-attention (GatedDeltaNet) layers — no KV cache to compress
                     continue
                 layer.self_attn.rotary_emb = language_model.rotary_emb
                 hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))

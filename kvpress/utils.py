@@ -7,6 +7,7 @@ from transformers import Cache, QuantizedCache
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 from transformers.models.phi3.modeling_phi3 import Phi3Attention
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeAttention, Qwen3_5MoeDynamicCache
 
 
 def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -38,6 +39,10 @@ def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> 
     if isinstance(module, Phi3Attention):
         qkv = module.qkv_proj(hidden_states)
         query_states = qkv[..., : num_heads * head_dim]
+    elif isinstance(module, Qwen3_5MoeAttention):
+        # Qwen3.5 MoE projects to (num_heads * head_dim * 2): query half + sigmoid-gate half.
+        qg = module.q_proj(hidden_states).view(bsz, q_len, num_heads, head_dim * 2)
+        return module.q_norm(torch.chunk(qg, 2, dim=-1)[0]).transpose(1, 2)
     elif hasattr(module, "q_proj"):
         # Assume Llama-like attention layer
         query_states = module.q_proj(hidden_states)
@@ -106,6 +111,8 @@ def extract_keys_and_values(cache: Cache, layer_idx: int) -> tuple[torch.Tensor,
     Extracts the keys and values from a given cache layer,
     handling both quantized and unquantized caches.
     """
+    if isinstance(cache, Qwen3_5MoeDynamicCache):
+        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
     if isinstance(cache, QuantizedCache):
         keys, values = dequantize_layer(cache.layers[layer_idx])
     else:
