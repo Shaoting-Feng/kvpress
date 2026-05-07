@@ -1,3 +1,6 @@
+  - master = the IMPRESS press implementation + bug fixes, on top of an old kvpress.
+  - aa-lcr-experiment = recent upstream kvpress + GPT-OSS compatibility patches + AA-LCR benchmark harness; has none of the IMPRESS work. 
+
 [![PyPI version](https://badge.fury.io/py/kvpress.svg)](https://badge.fury.io/py/kvpress)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Colab example notebook](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1JNvaTKuuAHrl49dYB9-mdEH_y52Ib-NP?usp=drive_link)
